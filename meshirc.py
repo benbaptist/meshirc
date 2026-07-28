@@ -40,6 +40,14 @@ class ChannelType(Enum):
     PRIVATE = "private"
 
 
+# MeshCore protocol overhead per message: command(1) + subcmd(1) +
+# chan_idx(1) + timestamp(4) = 7 bytes.  Frame max is 300 bytes, and
+# the firmware payload limit is ~228 bytes, so ~221 bytes remain for
+# text.  160 chars is a safe default that works for most UTF-8 text.
+DEFAULT_MAX_MSG_LENGTH = 160
+DEFAULT_THROTTLE_SECS = 3.0
+
+
 @dataclass
 class Config:
     meshcore_host: str = "192.168.1.100"
@@ -54,6 +62,8 @@ class Config:
     meshcore_channel_type: ChannelType = ChannelType.PUBLIC
     meshcore_channel_index: int = DEFAULT_CHANNEL_INDEX
     meshcore_channel_secret: Optional[str] = None
+    meshcore_msg_max_len: int = DEFAULT_MAX_MSG_LENGTH
+    meshcore_msg_throttle_secs: float = DEFAULT_THROTTLE_SECS
     log_level: str = "INFO"
 
     @classmethod
@@ -76,6 +86,12 @@ class Config:
                 os.getenv("MESHCORE_CHANNEL_INDEX", str(cls.meshcore_channel_index))
             ),
             meshcore_channel_secret=os.getenv("MESHCORE_CHANNEL_SECRET"),
+            meshcore_msg_max_len=int(os.getenv(
+                "MESHCORE_MSG_MAX_LEN", str(cls.meshcore_msg_max_len)
+            )),
+            meshcore_msg_throttle_secs=float(os.getenv(
+                "MESHCORE_MSG_THROTTLE_SECS", str(cls.meshcore_msg_throttle_secs)
+            )),
             log_level=os.getenv("LOG_LEVEL", cls.log_level),
         )
 
@@ -94,6 +110,8 @@ class MeshIrcBridge:
         self._irc_bot: Optional["_IrcBot"] = None
         self._irc_to_mesh: asyncio.Queue = asyncio.Queue()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._throttle_lock = asyncio.Lock()
+        self._last_send_time = 0.0
 
     # -- run -----------------------------------------------------------------
 
@@ -258,7 +276,69 @@ class MeshIrcBridge:
 
     # -- IRC → mesh ----------------------------------------------------------
 
-    async def _send_to_mesh(self, text: str):
+    def _split_message(self, text: str) -> list[str]:
+        """Split *text* into chunks that fit within the configured max length.
+
+        Each chunk is annotated with ``[i/n]`` so the receiver can reassemble.
+        If the text fits in a single message it is returned unchanged (no
+        annotation overhead added).
+        """
+        max_len = self._cfg.meshcore_msg_max_len
+        if len(text) <= max_len:
+            return [text]
+
+        # Reserve room for " [i/n]" suffix: 4 chars for " [", up to 3 digits
+        # for i, "/", up to 3 digits for n, "]"
+        # Worst case: " [999/999]" = 11 chars.  But we compute dynamically.
+        # First determine how many chunks we need, then use that to know the
+        # exact suffix width.
+        def _chunk_count(suffix_len: int) -> int:
+            payload = max_len - suffix_len
+            if payload <= 0:
+                return len(text)  # degenerate — each char gets its own chunk
+            return (len(text) + payload - 1) // payload
+
+        # Estimate n conservatively to pick suffix format.
+        rough_n = _chunk_count(7)  # " [xx/xx]" ≈ 7 chars
+        suffix_fmt = f" [{{i}}/{{n}}]" if rough_n <= 99 else f" [{{i}}/{{n}}]"
+        suffix_len = len(suffix_fmt.format(i=rough_n, n=rough_n))
+
+        # Now compute real n with correct suffix length.
+        n = _chunk_count(suffix_len)
+        # Recompute suffix_len with actual n — the length of the last chunk's
+        # suffix may differ if n is wider.  We handle that per-chunk below.
+        chunks: list[str] = []
+        pos = 0
+        for i in range(1, n + 1):
+            suffix = suffix_fmt.format(i=i, n=n)
+            remaining = len(text) - pos
+            chunk_payload = max_len - len(suffix)
+            if chunk_payload <= 0:
+                # Defensive: just emit the suffix alone if no room for text.
+                chunks.append(suffix)
+                continue
+            take = min(chunk_payload, remaining)
+            chunk = text[pos:pos + take] + suffix
+            chunks.append(chunk)
+            pos += take
+
+        return chunks
+
+    async def _throttled_send_to_mesh(self, text: str):
+        """Send a single message to MeshCore, respecting the throttle."""
+        async with self._throttle_lock:
+            now = asyncio.get_event_loop().time()
+            elapsed = now - self._last_send_time
+            min_gap = self._cfg.meshcore_msg_throttle_secs
+            if elapsed < min_gap:
+                wait = min_gap - elapsed
+                self._log.debug("Throttling send — waiting %.1fs", wait)
+                await asyncio.sleep(wait)
+            await self._send_one(text)
+            self._last_send_time = asyncio.get_event_loop().time()
+
+    async def _send_one(self, text: str):
+        """Actually transmit *text* to the MeshCore channel (no throttling)."""
         self._log.info("[irc → mesh] sending: %s", text)
         if self._mc is None or not self._mc.is_connected:
             self._log.warning("Cannot send to mesh — not connected")
@@ -270,6 +350,12 @@ class MeshIrcBridge:
             self._log.error("send_chan_msg failed: %s", result.payload)
         else:
             self._log.info("[irc → mesh] sent OK")
+
+    async def _send_to_mesh(self, text: str):
+        """Split and throttle the message, then send all chunks."""
+        chunks = self._split_message(text)
+        for chunk in chunks:
+            await self._throttled_send_to_mesh(chunk)
 
     def _on_irc_message(self, sender: str, text: str):
         self._log.info("[irc → mesh] from IRC: <%s> %s", sender, text)
