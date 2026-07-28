@@ -1,0 +1,2 @@
+python-dotenv>=1.0.0
+irc>=20.4.0

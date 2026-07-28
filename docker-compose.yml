@@ -1,0 +1,11 @@
+services:
+  meshirc:
+    build: .
+    container_name: meshirc
+    restart: unless-stopped
+    env_file:
+      - .env
+    # If you need to reach a MeshCore node on the host's network from
+    # macOS Docker Desktop, use host.docker.internal as MESHCORE_HOST.
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"
