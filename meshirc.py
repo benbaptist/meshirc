@@ -265,6 +265,10 @@ class MeshIrcBridge:
         text = payload.get("text", "")
         sender = payload.get("sender_name") or payload.get("pubkey_prefix", "unknown")
         self._log.info("[mesh → irc] %s: %s", sender, text)
+        # DEBUG: dump raw payload to see exactly what fields are available
+        self._log.info("[DEBUG] raw CHANNEL_MSG_RECV payload keys=%s full=%s",
+                        list(payload.keys()) if hasattr(payload, 'keys') else type(payload),
+                        payload)
         if self._irc_bot:
             self._irc_bot.queue_to_irc(sender, text)
 
