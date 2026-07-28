@@ -9,8 +9,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY meshirc.py .
 
-# Non-root user
-RUN useradd --system --no-create-home meshirc
+# Non-root user with /data write access
+RUN useradd --system --no-create-home meshirc && \
+    mkdir -p /data && chown meshirc /data
 USER meshirc
 
 ENTRYPOINT ["python", "meshirc.py"]

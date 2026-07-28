@@ -3,8 +3,9 @@
 MeshIRC — MeshCore ↔ IRC Bridge
 
 Connects to a MeshCore node via TCP (using the official meshcore library) and
-bridges messages to/from an IRC channel.  Automatically configures the target
-channel on the MeshCore node on startup.
+bridges messages to/from an IRC channel.  Configures the target channel on the
+MeshCore node on first run; on subsequent restarts it reuses the existing
+channel without overwriting it.
 
 Protocol: uses the meshcore Python library's binary protocol over TCP.
 """
@@ -15,9 +16,9 @@ import os
 import secrets
 import ssl
 import threading
-import time
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Optional
 
 import irc.bot
@@ -31,7 +32,7 @@ from meshcore import EventType, MeshCore
 # ---------------------------------------------------------------------------
 
 DEFAULT_CHANNEL_INDEX = 0
-MAX_CHANNELS = 40
+SECRET_FILE = Path("/data/channel_secret")
 
 
 class ChannelType(Enum):
@@ -52,6 +53,7 @@ class Config:
     meshcore_channel: str = "irc-bridge"
     meshcore_channel_type: ChannelType = ChannelType.PUBLIC
     meshcore_channel_index: int = DEFAULT_CHANNEL_INDEX
+    meshcore_channel_secret: Optional[str] = None
     log_level: str = "INFO"
 
     @classmethod
@@ -73,6 +75,7 @@ class Config:
             meshcore_channel_index=int(
                 os.getenv("MESHCORE_CHANNEL_INDEX", str(cls.meshcore_channel_index))
             ),
+            meshcore_channel_secret=os.getenv("MESHCORE_CHANNEL_SECRET"),
             log_level=os.getenv("LOG_LEVEL", cls.log_level),
         )
 
@@ -92,8 +95,9 @@ class MeshIrcBridge:
         self._irc_to_mesh: asyncio.Queue = asyncio.Queue()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
+    # -- run -----------------------------------------------------------------
+
     async def run(self):
-        """Connect both sides and run forever."""
         self._loop = asyncio.get_running_loop()
         self._log.info(
             "Bridge starting — meshcore(%s:%d) chan[%d]=%s ↔ IRC(%s:%d) %s",
@@ -105,17 +109,23 @@ class MeshIrcBridge:
         await self._connect_meshcore()
         self._start_irc()
 
+        # Run both loops concurrently
+        poller = asyncio.create_task(self._poll_mesh_loop())
         try:
             while True:
                 text = await self._irc_to_mesh.get()
                 await self._send_to_mesh(text)
-        except asyncio.CancelledError:
-            pass
         finally:
+            poller.cancel()
+            try:
+                await poller
+            except asyncio.CancelledError:
+                pass
             await self._shutdown()
 
+    # -- meshcore connection -------------------------------------------------
+
     async def _connect_meshcore(self):
-        """Connect to the MeshCore node and set up the channel."""
         self._log.info("Connecting to MeshCore node at %s:%d ...",
                         self._cfg.meshcore_host, self._cfg.meshcore_port)
         self._mc = await MeshCore.create_tcp(
@@ -127,6 +137,9 @@ class MeshIrcBridge:
             name = self._mc.self_info.get("adv_name", "unknown")
             self._log.info("Node name: %s", name)
 
+        self._mc.subscribe(EventType.CONNECTED, self._on_connected)
+        self._mc.subscribe(EventType.DISCONNECTED, self._on_disconnected)
+
         await self._setup_channel()
 
         self._mc.subscribe(
@@ -134,30 +147,34 @@ class MeshIrcBridge:
             self._on_mesh_message,
             attribute_filters={"channel_idx": self._cfg.meshcore_channel_index},
         )
-        await self._mc.start_auto_message_fetching()
+
+    # -- channel setup -------------------------------------------------------
 
     async def _setup_channel(self):
-        """Create or verify the target channel on the node."""
+        """Create or verify the target channel without clobbering on restart."""
         idx = self._cfg.meshcore_channel_index
         ch_type = self._cfg.meshcore_channel_type
         ch_name = self._cfg.meshcore_channel
 
+        if ch_type == ChannelType.PUBLIC and not ch_name.startswith("#"):
+            ch_name = "#" + ch_name
+
+        existing = await self._mc.commands.get_channel(idx)
+        if existing.type == EventType.CHANNEL_INFO:
+            existing_name = existing.payload.get("name", "")
+            if existing_name.rstrip("\x00") == ch_name:
+                self._log.info("Channel [%d] %s already configured — reusing.", idx, ch_name)
+                return
+            self._log.info("Slot [%d] holds '%s' — replacing with '%s'.",
+                            idx, existing_name.rstrip("\x00"), ch_name)
+
         if ch_type == ChannelType.PUBLIC:
-            if not ch_name.startswith("#"):
-                ch_name = "#" + ch_name
-            self._log.info("Setting up public channel [%d]: %s", idx, ch_name)
+            self._log.info("Creating public channel [%d]: %s", idx, ch_name)
             result = await self._mc.commands.set_channel(idx, ch_name)
-            if result.type == EventType.ERROR:
-                self._log.error("Failed to set channel: %s", result.payload)
-                raise RuntimeError(f"Channel setup failed: {result.payload}")
-            self._log.info("Public channel configured (key derived from name hash).")
         else:
-            secret = secrets.token_bytes(16)
-            self._log.info("Setting up private channel [%d]: %s", idx, ch_name)
+            secret = self._resolve_private_secret()
+            self._log.info("Creating private channel [%d]: %s", idx, ch_name)
             result = await self._mc.commands.set_channel(idx, ch_name, secret)
-            if result.type == EventType.ERROR:
-                self._log.error("Failed to set channel: %s", result.payload)
-                raise RuntimeError(f"Channel setup failed: {result.payload}")
             secret_hex = secret.hex()
             banner = (
                 f"\n{'='*60}\n"
@@ -167,21 +184,65 @@ class MeshIrcBridge:
                 f"{'='*60}\n"
             )
             print(banner, flush=True)
-            self._log.info("Private channel configured. Secret: %s", secret_hex)
+            self._log.info("Private channel secret: %s", secret_hex)
 
-    async def _send_to_mesh(self, text: str):
-        """Send a message to the MeshCore channel."""
-        if self._mc is None or not self._mc.is_connected:
-            self._log.warning("Cannot send to mesh — not connected")
-            return
-        result = await self._mc.commands.send_chan_msg(
-            self._cfg.meshcore_channel_index, text
-        )
         if result.type == EventType.ERROR:
-            self._log.error("Failed to send mesh message: %s", result.payload)
+            self._log.error("Channel setup failed: %s", result.payload)
+            raise RuntimeError(f"Channel setup failed: {result.payload}")
+
+    def _resolve_private_secret(self) -> bytes:
+        """Return 16-byte secret: env var > persisted file > generate new."""
+        env_hex = self._cfg.meshcore_channel_secret
+        if env_hex:
+            try:
+                secret = bytes.fromhex(env_hex)
+                if len(secret) == 16:
+                    self._log.info("Using secret from MESHCORE_CHANNEL_SECRET.")
+                    return secret
+            except ValueError:
+                pass
+            self._log.warning("MESHCORE_CHANNEL_SECRET invalid — ignoring.")
+
+        try:
+            if SECRET_FILE.exists():
+                secret = bytes.fromhex(SECRET_FILE.read_text().strip())
+                if len(secret) == 16:
+                    self._log.info("Reusing persisted secret from %s.", SECRET_FILE)
+                    return secret
+        except Exception:
+            pass
+
+        secret = secrets.token_bytes(16)
+        try:
+            SECRET_FILE.parent.mkdir(parents=True, exist_ok=True)
+            SECRET_FILE.write_text(secret.hex())
+            self._log.info("New secret persisted to %s.", SECRET_FILE)
+        except OSError as exc:
+            self._log.warning("Could not persist secret: %s", exc)
+        return secret
+
+    # -- mesh message polling ------------------------------------------------
+
+    async def _poll_mesh_loop(self):
+        """Continuously poll for messages instead of relying on push events."""
+        self._log.info("Poll loop started.")
+        while True:
+            try:
+                await asyncio.sleep(1)
+                if self._mc is None or not self._mc.is_connected:
+                    self._log.debug("Poll skip: not connected")
+                    continue
+                result = await self._mc.commands.get_msg(timeout=3.0)
+                if result.type != EventType.NO_MORE_MSGS:
+                    self._log.info("Poll result: %s", result.type.value)
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                self._log.warning("Poll error: %s", exc)
+
+    # -- mesh → IRC ----------------------------------------------------------
 
     async def _on_mesh_message(self, event):
-        """Handle incoming CHANNEL_MSG_RECV from the mesh."""
         payload = event.payload
         text = payload.get("text", "")
         sender = payload.get("sender_name") or payload.get("pubkey_prefix", "unknown")
@@ -189,16 +250,44 @@ class MeshIrcBridge:
         if self._irc_bot:
             self._irc_bot.queue_to_irc(sender, text)
 
+    async def _on_connected(self, event):
+        self._log.info("[meshcore] connected: %s", event.payload)
+
+    async def _on_disconnected(self, event):
+        self._log.warning("[meshcore] disconnected: %s", event.payload)
+
+    # -- IRC → mesh ----------------------------------------------------------
+
+    async def _send_to_mesh(self, text: str):
+        self._log.info("[irc → mesh] sending: %s", text)
+        if self._mc is None or not self._mc.is_connected:
+            self._log.warning("Cannot send to mesh — not connected")
+            return
+        result = await self._mc.commands.send_chan_msg(
+            self._cfg.meshcore_channel_index, text
+        )
+        if result.type == EventType.ERROR:
+            self._log.error("send_chan_msg failed: %s", result.payload)
+        else:
+            self._log.info("[irc → mesh] sent OK")
+
     def _on_irc_message(self, sender: str, text: str):
-        """Called from IRC thread — schedule send on asyncio loop."""
+        self._log.info("[irc → mesh] from IRC: <%s> %s", sender, text)
         if self._loop:
             self._loop.call_soon_threadsafe(
                 self._irc_to_mesh.put_nowait, f"<{sender}> {text}"
             )
 
+    # -- IRC -----------------------------------------------------------------
+
     def _start_irc(self):
         self._irc_bot = _IrcBot(self._cfg, self._on_irc_message)
-        self._irc_bot.start()
+        # IRC bot's start() calls reactor.process_forever() which blocks,
+        # so it MUST run in its own thread.
+        thread = threading.Thread(target=self._irc_bot.start, daemon=True, name="irc-bot")
+        thread.start()
+
+    # -- shutdown ------------------------------------------------------------
 
     async def _shutdown(self):
         self._log.info("Shutting down...")
@@ -206,21 +295,16 @@ class MeshIrcBridge:
             self._irc_bot.stop()
         if self._mc:
             try:
-                await self._mc.stop_auto_message_fetching()
-            except Exception:
-                pass
-            try:
                 await self._mc.disconnect()
             except Exception:
                 pass
 
 
 # ---------------------------------------------------------------------------
-# IRC Bot (runs in its own thread)
+# IRC Bot
 # ---------------------------------------------------------------------------
 
 class _IrcBot(irc.bot.SingleServerIRCBot):
-    """IRC bot that bridges to MeshCore."""
 
     def __init__(self, config: Config, on_message_callback):
         self._cfg = config
@@ -262,7 +346,6 @@ class _IrcBot(irc.bot.SingleServerIRCBot):
         self._log.warning("Disconnected from IRC — will auto-reconnect")
 
     def queue_to_irc(self, sender: str, text: str):
-        """Thread-safe: relay a mesh message to IRC."""
         conn = self.connection
         if conn and conn.is_connected():
             formatted = f"\x0303[{sender}]\x03 {text}"
