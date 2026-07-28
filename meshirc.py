@@ -274,9 +274,9 @@ class IrcBridgeBot(irc.bot.SingleServerIRCBot):
         self._log = logging.getLogger("irc")
 
         factory = irc.connection.Factory(
-            wrapper=ssl.wrap_socket if config.irc_use_tls else None,
+            wrapper=ssl.SSLContext().wrap_socket if config.irc_use_tls else None,
         )
-        server = irc.client.ServerSpec(
+        server = irc.bot.ServerSpec(
             config.irc_host,
             config.irc_port,
         )
@@ -284,7 +284,7 @@ class IrcBridgeBot(irc.bot.SingleServerIRCBot):
         if config.irc_use_tls:
             kwargs["connect_factory"] = factory
         super().__init__(
-            [(server,)],
+            [server],
             config.irc_nick,
             config.irc_realname,
             **kwargs,
