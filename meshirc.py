@@ -263,14 +263,12 @@ class MeshIrcBridge:
     async def _on_mesh_message(self, event):
         payload = event.payload
         text = payload.get("text", "")
-        sender = payload.get("sender_name") or payload.get("pubkey_prefix", "unknown")
-        self._log.info("[mesh → irc] %s: %s", sender, text)
-        # DEBUG: dump raw payload to see exactly what fields are available
-        self._log.info("[DEBUG] raw CHANNEL_MSG_RECV payload keys=%s full=%s",
-                        list(payload.keys()) if hasattr(payload, 'keys') else type(payload),
-                        payload)
+        # Channel messages embed the sender name in the text itself
+        # (e.g. "DeviceName (ShortName): message") — no separate sender
+        # field exists in the payload (no sender_name or pubkey_prefix).
+        self._log.info("[mesh → irc] %s", text)
         if self._irc_bot:
-            self._irc_bot.queue_to_irc(sender, text)
+            self._irc_bot.queue_to_irc(text)
 
     async def _on_connected(self, event):
         self._log.info("[meshcore] connected: %s", event.payload)
@@ -435,11 +433,12 @@ class _IrcBot(irc.bot.SingleServerIRCBot):
     def on_disconnect(self, conn, event):
         self._log.warning("Disconnected from IRC — will auto-reconnect")
 
-    def queue_to_irc(self, sender: str, text: str):
+    def queue_to_irc(self, text: str):
         conn = self.connection
         if conn and conn.is_connected():
-            formatted = f"\x0303[{sender}]\x03 {text}"
-            conn.privmsg(self._cfg.irc_channel, formatted)
+            # Sender name is already embedded in the text by the MeshCore
+            # firmware (e.g. "DeviceName (ShortName): message").
+            conn.privmsg(self._cfg.irc_channel, text)
 
     def stop(self):
         try:
