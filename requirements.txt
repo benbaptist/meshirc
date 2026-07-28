@@ -1,2 +1,3 @@
 python-dotenv>=1.0.0
 irc>=20.4.0
+meshcore>=2.0.0
