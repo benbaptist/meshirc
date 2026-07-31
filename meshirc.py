@@ -11,6 +11,7 @@ Protocol: uses the meshcore Python library's binary protocol over TCP.
 """
 
 import asyncio
+import itertools
 import logging
 import os
 import secrets
@@ -394,6 +395,9 @@ class MeshIrcBridge:
 
 class _IrcBot(irc.bot.SingleServerIRCBot):
 
+    # Keepalive: send a PING every KEEPALIVE_SECS to prevent idle disconnects.
+    KEEPALIVE_SECS = 180
+
     def __init__(self, config: Config, on_message_callback):
         self._cfg = config
         self._on_message = on_message_callback
@@ -404,10 +408,19 @@ class _IrcBot(irc.bot.SingleServerIRCBot):
             kwargs["connect_factory"] = irc.connection.Factory(
                 wrapper=ssl.SSLContext().wrap_socket
             )
+
+        # Use exponential backoff with shorter, saner intervals so
+        # reconnection happens quickly (5-60 s) instead of the library
+        # default 60-300 s.  The attempt counter is reset in on_welcome
+        # so the backoff doesn't grow unboundedly over the container's
+        # lifetime.
+        recon = irc.bot.ExponentialBackoff(min_interval=5, max_interval=60)
+
         super().__init__(
             [irc.bot.ServerSpec(config.irc_host, config.irc_port)],
             config.irc_nick,
             config.irc_realname,
+            recon=recon,
             **kwargs,
         )
 
@@ -415,6 +428,14 @@ class _IrcBot(irc.bot.SingleServerIRCBot):
         self._log.info("Connected to IRC server %s", self._cfg.irc_host)
         conn.join(self._cfg.irc_channel)
         self._log.info("Joined IRC channel %s", self._cfg.irc_channel)
+
+        # Start client-side keepalive PINGs so the IRC server doesn't
+        # drop us for idling.
+        conn.set_keepalive(self.KEEPALIVE_SECS)
+
+        # Reset the exponential-backoff attempt counter so that a
+        # successful connection always restores the shortest delay.
+        self.recon.attempt_count = itertools.count(1)
 
     def on_pubmsg(self, conn, event):
         nick = irc.client.NickMask(event.source).nick
