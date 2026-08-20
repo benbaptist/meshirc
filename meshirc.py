@@ -47,6 +47,12 @@ class ChannelType(Enum):
 # text.  160 chars is a safe default that works for most UTF-8 text.
 DEFAULT_MAX_MSG_LENGTH = 160
 DEFAULT_THROTTLE_SECS = 3.0
+# Cap on the IRC → mesh backlog held while the mesh node is unreachable.
+MAX_PENDING_MESSAGES = 200
+# The meshcore library treats max_reconnect_attempts as a *lifetime* cap on
+# consecutive failed reconnect attempts.  A bridge must never permanently
+# give up on the mesh, so use an effectively unbounded value.
+MESH_RECONNECT_ATTEMPTS = 2**31 - 1
 
 
 @dataclass
@@ -113,6 +119,9 @@ class MeshIrcBridge:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._throttle_lock = asyncio.Lock()
         self._last_send_time = 0.0
+        # IRC → mesh messages queued while the mesh node is disconnected,
+        # flushed on reconnect.  Bounded to avoid unbounded memory growth.
+        self._mesh_pending: list[str] = []
 
     # -- run -----------------------------------------------------------------
 
@@ -149,7 +158,8 @@ class MeshIrcBridge:
                         self._cfg.meshcore_host, self._cfg.meshcore_port)
         self._mc = await MeshCore.create_tcp(
             self._cfg.meshcore_host, self._cfg.meshcore_port,
-            auto_reconnect=True, max_reconnect_attempts=10,
+            auto_reconnect=True,
+            max_reconnect_attempts=MESH_RECONNECT_ATTEMPTS,
         )
         self._log.info("Connected to MeshCore node.")
         if self._mc.self_info:
@@ -273,6 +283,7 @@ class MeshIrcBridge:
 
     async def _on_connected(self, event):
         self._log.info("[meshcore] connected: %s", event.payload)
+        await self._flush_pending_to_mesh()
 
     async def _on_disconnected(self, event):
         self._log.warning("[meshcore] disconnected: %s", event.payload)
@@ -340,25 +351,60 @@ class MeshIrcBridge:
             await self._send_one(text)
             self._last_send_time = asyncio.get_event_loop().time()
 
+    def _buffer_for_mesh(self, text: str):
+        """Queue *text* for delivery once the mesh node reconnects."""
+        if len(self._mesh_pending) >= MAX_PENDING_MESSAGES:
+            dropped = self._mesh_pending.pop(0)
+            self._log.warning(
+                "Mesh backlog full (%d) — dropping oldest message: %s",
+                MAX_PENDING_MESSAGES, dropped,
+            )
+        self._mesh_pending.append(text)
+        self._log.info(
+            "Mesh not connected — queued message (%d pending)",
+            len(self._mesh_pending),
+        )
+
     async def _send_one(self, text: str):
         """Actually transmit *text* to the MeshCore channel (no throttling)."""
-        self._log.info("[irc → mesh] sending: %s", text)
         if self._mc is None or not self._mc.is_connected:
-            self._log.warning("Cannot send to mesh — not connected")
+            self._buffer_for_mesh(text)
             return
-        result = await self._mc.commands.send_chan_msg(
-            self._cfg.meshcore_channel_index, text
-        )
+        self._log.info("[irc → mesh] sending: %s", text)
+        try:
+            result = await self._mc.commands.send_chan_msg(
+                self._cfg.meshcore_channel_index, text
+            )
+        except Exception as exc:
+            self._log.error("send_chan_msg raised: %s", exc)
+            return
         if result.type == EventType.ERROR:
             self._log.error("send_chan_msg failed: %s", result.payload)
         else:
             self._log.info("[irc → mesh] sent OK")
 
     async def _send_to_mesh(self, text: str):
-        """Split and throttle the message, then send all chunks."""
+        """Split and throttle the message, then send all chunks.
+
+        While the mesh node is disconnected the chunks are queued instead, so
+        no IRC traffic is lost during an outage.
+        """
         chunks = self._split_message(text)
+        if self._mc is None or not self._mc.is_connected:
+            for chunk in chunks:
+                self._buffer_for_mesh(chunk)
+            return
         for chunk in chunks:
             await self._throttled_send_to_mesh(chunk)
+
+    async def _flush_pending_to_mesh(self):
+        """Deliver any queued IRC → mesh messages after a reconnect."""
+        if not self._mesh_pending:
+            return
+        pending, self._mesh_pending = self._mesh_pending, []
+        self._log.info("Flushing %d queued message(s) to mesh", len(pending))
+        for text in pending:
+            await self._throttled_send_to_mesh(text)
 
     def _on_irc_message(self, sender: str, text: str):
         self._log.info("[irc → mesh] from IRC: <%s> %s", sender, text)
@@ -393,7 +439,56 @@ class MeshIrcBridge:
 # IRC Bot
 # ---------------------------------------------------------------------------
 
+class _SafeServerConnection(irc.client.ServerConnection):
+    """ServerConnection that can't crash the reactor thread when disconnected.
+
+    The stock library's ``set_keepalive`` schedules a recurring PING with
+    ``reactor.scheduler.execute_every``; that command outlives the connection,
+    so after a disconnect it fires ``ping()`` against a closed socket and
+    raises ``ServerNotConnectedError`` — killing the reactor thread and, with
+    it, every future reconnect.  The same applies to the library's automatic
+    PONG replies on incoming server PINGs.
+
+    This subclass makes sends on a dead connection no-ops, and replaces the
+    library keepalive with a self-arming one-shot that can be cancelled on
+    disconnect via ``clear_keepalive``.
+    """
+
+    def ping(self, target, target2=""):
+        if self.is_connected():
+            super().ping(target, target2)
+
+    def pong(self, target, target2=""):
+        if self.is_connected():
+            super().pong(target, target2)
+
+    def set_keepalive(self, interval):
+        self._keepalive_interval = interval
+        # Each keepalive call invalidates any previously scheduled chain, so
+        # reconnects don't stack duplicate pingers.
+        gen = getattr(self, "_keepalive_gen", 0) + 1
+        self._keepalive_gen = gen
+
+        def tick():
+            if getattr(self, "_keepalive_gen", 0) != gen:
+                return  # superseded by a newer keepalive or a disconnect
+            self.ping("keep-alive")  # guarded no-op when disconnected
+            self.reactor.scheduler.execute_after(self._keepalive_interval, tick)
+
+        self.reactor.scheduler.execute_after(self._keepalive_interval, tick)
+
+    def clear_keepalive(self):
+        """Stop the keepalive chain (call on disconnect)."""
+        self._keepalive_gen = getattr(self, "_keepalive_gen", 0) + 1
+
+
+class _SafeReactor(irc.client.Reactor):
+    connection_class = _SafeServerConnection
+
+
 class _IrcBot(irc.bot.SingleServerIRCBot):
+
+    reactor_class = _SafeReactor
 
     # Keepalive: send a PING every KEEPALIVE_SECS to prevent idle disconnects.
     KEEPALIVE_SECS = 180
@@ -452,14 +547,19 @@ class _IrcBot(irc.bot.SingleServerIRCBot):
         self._on_message(nick, f"[PM] {text}")
 
     def on_disconnect(self, conn, event):
+        conn.clear_keepalive()
         self._log.warning("Disconnected from IRC — will auto-reconnect")
 
     def queue_to_irc(self, text: str):
         conn = self.connection
-        if conn and conn.is_connected():
+        if not conn.is_connected():
+            return
+        try:
             # Sender name is already embedded in the text by the MeshCore
             # firmware (e.g. "DeviceName (ShortName): message").
             conn.privmsg(self._cfg.irc_channel, text)
+        except irc.client.ServerNotConnectedError:
+            self._log.debug("Dropped message to IRC — not connected")
 
     def stop(self):
         try:
