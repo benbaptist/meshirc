@@ -26,7 +26,7 @@ import irc.bot
 import irc.client
 import irc.connection
 from dotenv import load_dotenv
-from meshcore import EventType, MeshCore
+from meshcore import EventType, MeshCore, TCPConnection
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -53,6 +53,8 @@ MAX_PENDING_MESSAGES = 200
 # consecutive failed reconnect attempts.  A bridge must never permanently
 # give up on the mesh, so use an effectively unbounded value.
 MESH_RECONNECT_ATTEMPTS = 2**31 - 1
+# Delay between initial-connection attempts while the mesh node is down.
+MESH_RETRY_SECS = 5
 
 
 @dataclass
@@ -122,6 +124,8 @@ class MeshIrcBridge:
         # IRC → mesh messages queued while the mesh node is disconnected,
         # flushed on reconnect.  Bounded to avoid unbounded memory growth.
         self._mesh_pending: list[str] = []
+        # True once the mesh channel is configured and ready for sends.
+        self._mesh_ready = False
 
     # -- run -----------------------------------------------------------------
 
@@ -134,48 +138,121 @@ class MeshIrcBridge:
             self._cfg.irc_host, self._cfg.irc_port, self._cfg.irc_channel,
         )
 
-        await self._connect_meshcore()
+        # IRC runs in its own thread and is independent of mesh availability.
         self._start_irc()
 
-        # Run both loops concurrently
-        poller = asyncio.create_task(self._poll_mesh_loop())
+        # The mesh connection retries forever in the background; IRC → mesh
+        # traffic is buffered until it is up.
+        mesh_task = asyncio.create_task(self._connect_meshcore())
+        poll_task = asyncio.create_task(self._poll_mesh_loop())
+
         try:
             while True:
                 text = await self._irc_to_mesh.get()
                 await self._send_to_mesh(text)
         finally:
-            poller.cancel()
-            try:
-                await poller
-            except asyncio.CancelledError:
-                pass
+            for task in (mesh_task, poll_task):
+                task.cancel()
+            for task in (mesh_task, poll_task):
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as exc:
+                    self._log.error("Background task failed: %s", exc)
             await self._shutdown()
 
     # -- meshcore connection -------------------------------------------------
 
     async def _connect_meshcore(self):
-        self._log.info("Connecting to MeshCore node at %s:%d ...",
-                        self._cfg.meshcore_host, self._cfg.meshcore_port)
-        self._mc = await MeshCore.create_tcp(
-            self._cfg.meshcore_host, self._cfg.meshcore_port,
+        while True:
+            self._log.info("Connecting to MeshCore node at %s:%d ...",
+                            self._cfg.meshcore_host, self._cfg.meshcore_port)
+            try:
+                self._mc = await self._create_meshcore()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._mc = None
+                self._log.warning(
+                    "MeshCore connection failed: %s — retrying in %ds",
+                    exc, MESH_RETRY_SECS,
+                )
+                await asyncio.sleep(MESH_RETRY_SECS)
+                continue
+            if self._mc is None:
+                self._log.warning(
+                    "MeshCore node not responding — retrying in %ds",
+                    MESH_RETRY_SECS,
+                )
+                await asyncio.sleep(MESH_RETRY_SECS)
+                continue
+
+            self._log.info("Connected to MeshCore node.")
+            if self._mc.self_info:
+                name = self._mc.self_info.get("adv_name", "unknown")
+                self._log.info("Node name: %s", name)
+
+            try:
+                await self._setup_channel()
+                self._mc.subscribe(EventType.CONNECTED, self._on_connected)
+                self._mc.subscribe(EventType.DISCONNECTED, self._on_disconnected)
+                self._mc.subscribe(
+                    EventType.CHANNEL_MSG_RECV,
+                    self._on_mesh_message,
+                    attribute_filters={"channel_idx": self._cfg.meshcore_channel_index},
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._log.error(
+                    "MeshCore channel setup failed: %s — reconnecting in %ds",
+                    exc, MESH_RETRY_SECS,
+                )
+                await self._disconnect_meshcore()
+                await asyncio.sleep(MESH_RETRY_SECS)
+                continue
+
+            self._mesh_ready = True
+            self._log.info("MeshCore channel ready.")
+            # The initial CONNECTED event fired before we subscribed, so flush
+            # any messages queued while the node was unreachable.
+            await self._flush_pending_to_mesh()
+            break
+
+    async def _create_meshcore(self) -> Optional[MeshCore]:
+        """Create and connect a MeshCore instance, cleaning up on failure.
+
+        ``MeshCore.create_tcp`` leaks its event-dispatcher task when the TCP
+        connect raises (it never returns the half-built instance), so build
+        the instance here and always disconnect it on failure.
+        """
+        connection = TCPConnection(
+            self._cfg.meshcore_host, self._cfg.meshcore_port
+        )
+        mc = MeshCore(
+            connection,
             auto_reconnect=True,
             max_reconnect_attempts=MESH_RECONNECT_ATTEMPTS,
         )
-        self._log.info("Connected to MeshCore node.")
-        if self._mc.self_info:
-            name = self._mc.self_info.get("adv_name", "unknown")
-            self._log.info("Node name: %s", name)
+        try:
+            result = await mc.connect()
+        except BaseException:
+            await mc.disconnect()
+            raise
+        if result is None:
+            await mc.disconnect()
+            return None
+        return mc
 
-        self._mc.subscribe(EventType.CONNECTED, self._on_connected)
-        self._mc.subscribe(EventType.DISCONNECTED, self._on_disconnected)
-
-        await self._setup_channel()
-
-        self._mc.subscribe(
-            EventType.CHANNEL_MSG_RECV,
-            self._on_mesh_message,
-            attribute_filters={"channel_idx": self._cfg.meshcore_channel_index},
-        )
+    async def _disconnect_meshcore(self):
+        if self._mc is None:
+            return
+        mc, self._mc = self._mc, None
+        try:
+            await mc.disconnect()
+        except Exception:
+            pass
 
     # -- channel setup -------------------------------------------------------
 
@@ -359,15 +436,29 @@ class MeshIrcBridge:
                 "Mesh backlog full (%d) — dropping oldest message: %s",
                 MAX_PENDING_MESSAGES, dropped,
             )
+        was_empty = not self._mesh_pending
         self._mesh_pending.append(text)
-        self._log.info(
-            "Mesh not connected — queued message (%d pending)",
-            len(self._mesh_pending),
+        if was_empty:
+            self._log.warning(
+                "Mesh not connected — queueing IRC messages until it returns"
+            )
+        else:
+            self._log.debug(
+                "Mesh not connected — queued message (%d pending)",
+                len(self._mesh_pending),
+            )
+
+    def _mesh_can_send(self) -> bool:
+        """True once the mesh channel is configured and the node is connected."""
+        return (
+            self._mesh_ready
+            and self._mc is not None
+            and self._mc.is_connected
         )
 
     async def _send_one(self, text: str):
         """Actually transmit *text* to the MeshCore channel (no throttling)."""
-        if self._mc is None or not self._mc.is_connected:
+        if not self._mesh_can_send():
             self._buffer_for_mesh(text)
             return
         self._log.info("[irc → mesh] sending: %s", text)
@@ -390,7 +481,7 @@ class MeshIrcBridge:
         no IRC traffic is lost during an outage.
         """
         chunks = self._split_message(text)
-        if self._mc is None or not self._mc.is_connected:
+        if not self._mesh_can_send():
             for chunk in chunks:
                 self._buffer_for_mesh(chunk)
             return
@@ -399,7 +490,7 @@ class MeshIrcBridge:
 
     async def _flush_pending_to_mesh(self):
         """Deliver any queued IRC → mesh messages after a reconnect."""
-        if not self._mesh_pending:
+        if not self._mesh_pending or not self._mesh_can_send():
             return
         pending, self._mesh_pending = self._mesh_pending, []
         self._log.info("Flushing %d queued message(s) to mesh", len(pending))
@@ -428,11 +519,7 @@ class MeshIrcBridge:
         self._log.info("Shutting down...")
         if self._irc_bot:
             self._irc_bot.stop()
-        if self._mc:
-            try:
-                await self._mc.disconnect()
-            except Exception:
-                pass
+        await self._disconnect_meshcore()
 
 
 # ---------------------------------------------------------------------------
