@@ -15,6 +15,7 @@ import itertools
 import logging
 import os
 import secrets
+import signal
 import ssl
 import threading
 from dataclasses import dataclass
@@ -131,6 +132,7 @@ class MeshIrcBridge:
 
     async def run(self):
         self._loop = asyncio.get_running_loop()
+        self._install_signal_handlers()
         self._log.info(
             "Bridge starting — meshcore(%s:%d) chan[%d]=%s ↔ IRC(%s:%d) %s",
             self._cfg.meshcore_host, self._cfg.meshcore_port,
@@ -161,6 +163,24 @@ class MeshIrcBridge:
                 except Exception as exc:
                     self._log.error("Background task failed: %s", exc)
             await self._shutdown()
+
+    def _install_signal_handlers(self):
+        """Exit cleanly on SIGINT/SIGTERM instead of hanging as PID 1.
+
+        Docker runs this process as PID 1, where the kernel ignores any
+        signal whose default action is "terminate" unless a handler is
+        installed.  Cancelling the main task triggers the ``finally``
+        block above, which stops the IRC bot and disconnects the mesh
+        node before the process exits.
+        """
+        main_task = asyncio.current_task()
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            try:
+                self._loop.add_signal_handler(signum, main_task.cancel)
+            except (NotImplementedError, RuntimeError, ValueError):
+                # Non-main thread, unsupported on this platform, or a
+                # signal handler is already installed.
+                pass
 
     # -- meshcore connection -------------------------------------------------
 
@@ -676,6 +696,8 @@ def main():
         asyncio.run(bridge.run())
     except KeyboardInterrupt:
         logging.info("Interrupted.")
+    except asyncio.CancelledError:
+        logging.info("Shutdown complete.")
 
 
 if __name__ == "__main__":
