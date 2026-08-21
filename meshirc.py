@@ -577,8 +577,10 @@ class _IrcBot(irc.bot.SingleServerIRCBot):
 
     reactor_class = _SafeReactor
 
-    # Keepalive: send a PING every KEEPALIVE_SECS to prevent idle disconnects.
-    KEEPALIVE_SECS = 180
+    # Keepalive: send a PING every KEEPALIVE_SECS to keep the socket (and any
+    # intervening NAT/firewall mapping) alive.  15s is aggressive enough to
+    # stop idle timeouts from both the ircd and middleboxes.
+    KEEPALIVE_SECS = 15
 
     def __init__(self, config: Config, on_message_callback):
         self._cfg = config
