@@ -530,8 +530,15 @@ class MeshIrcBridge:
         self._irc_bot = _IrcBot(self._cfg, self._on_irc_message)
         # IRC bot's start() calls reactor.process_forever() which blocks,
         # so it MUST run in its own thread.
-        thread = threading.Thread(target=self._irc_bot.start, daemon=True, name="irc-bot")
+        thread = threading.Thread(target=self._run_irc_bot, daemon=True, name="irc-bot")
         thread.start()
+
+    def _run_irc_bot(self):
+        """Run the IRC bot, logging any crash instead of dying silently."""
+        try:
+            self._irc_bot.start()
+        except Exception:
+            self._log.exception("IRC bot thread crashed — IRC bridge is down")
 
     # -- shutdown ------------------------------------------------------------
 
@@ -549,6 +556,13 @@ class MeshIrcBridge:
 class _SafeServerConnection(irc.client.ServerConnection):
     """ServerConnection that can't crash the reactor thread when disconnected.
 
+    Also decodes incoming lines leniently: the stock ``DecodingLineBuffer``
+    uses ``errors='strict'``, so a message truncated mid-UTF-8-character
+    (e.g. a long line cut at a byte boundary by another bridge) raises
+    ``UnicodeDecodeError`` inside the buffer iterator and kills the reactor
+    thread.  ``LenientDecodingLineBuffer`` decodes with ``errors='replace'``,
+    substituting U+FFFD for malformed bytes instead of crashing.
+
     The stock library's ``set_keepalive`` schedules a recurring PING with
     ``reactor.scheduler.execute_every``; that command outlives the connection,
     so after a disconnect it fires ``ping()`` against a closed socket and
@@ -560,6 +574,8 @@ class _SafeServerConnection(irc.client.ServerConnection):
     library keepalive with a self-arming one-shot that can be cancelled on
     disconnect via ``clear_keepalive``.
     """
+
+    buffer_class = irc.client.buffer.LenientDecodingLineBuffer
 
     def ping(self, target, target2=""):
         if self.is_connected():
