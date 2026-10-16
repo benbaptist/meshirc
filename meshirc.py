@@ -751,7 +751,7 @@ class MeshIrcBridge:
             return [f"Usage: {prefix}raw <text>"]
         # Callout first so the raw line is the last thing other bots see.
         self._irc_bot.send_to_channel(
-            f"[MeshCore] {sender or 'unknown node'} used {prefix}raw"
+            f"{sender or 'unknown node'} said:"
         )
         self._irc_bot.send_to_channel(args)
         return []

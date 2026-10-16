@@ -59,4 +59,4 @@ Commands are not bridged; the bridge answers them directly.
 |---|---|
 | `!list` | IRC channel members grouped by status (ops, voice, ...) |
 | `!topic` | IRC channel topic |
-| `!raw <text>` | Send `<text>` to IRC without the sender prefix, preceded by a message naming the calling node |
+| `!raw <text>` | Send `<text>` to IRC without the sender prefix, preceded by a `<node> said:` message naming the calling node |
