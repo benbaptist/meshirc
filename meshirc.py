@@ -14,10 +14,12 @@ import asyncio
 import itertools
 import logging
 import os
+import random
 import secrets
 import signal
 import ssl
 import threading
+import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -28,6 +30,18 @@ import irc.client
 import irc.connection
 from dotenv import load_dotenv
 from meshcore import EventType, MeshCore, TCPConnection
+
+from commands import (
+    CONTACT_TYPE_REPEATER,
+    find_infra_contacts,
+    is_hex,
+    pack_lines,
+    paginate,
+    parse_irc_command,
+    parse_mesh_command,
+    path_hash_hex,
+    split_sender,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -56,6 +70,12 @@ MAX_PENDING_MESSAGES = 200
 MESH_RECONNECT_ATTEMPTS = 2**31 - 1
 # Delay between initial-connection attempts while the mesh node is down.
 MESH_RETRY_SECS = 5
+# Entries per page of the IRC "list" command.
+LIST_PAGE_SIZE = 3
+# Trace hash width (bytes) used when pinging a repeater/room chosen by name.
+PING_NAME_HASH_BYTES = 1
+# Lower bound on how long a ping waits for its trace reply.
+MIN_PING_TIMEOUT_SECS = 5.0
 
 
 @dataclass
@@ -74,6 +94,8 @@ class Config:
     meshcore_channel_secret: Optional[str] = None
     meshcore_msg_max_len: int = DEFAULT_MAX_MSG_LENGTH
     meshcore_msg_throttle_secs: float = DEFAULT_THROTTLE_SECS
+    irc_command_prefix: str = "&"
+    mesh_command_prefix: str = "!"
     log_level: str = "INFO"
 
     @classmethod
@@ -102,6 +124,8 @@ class Config:
             meshcore_msg_throttle_secs=float(os.getenv(
                 "MESHCORE_MSG_THROTTLE_SECS", str(cls.meshcore_msg_throttle_secs)
             )),
+            irc_command_prefix=os.getenv("IRC_COMMAND_PREFIX", cls.irc_command_prefix),
+            mesh_command_prefix=os.getenv("MESH_COMMAND_PREFIX", cls.mesh_command_prefix),
             log_level=os.getenv("LOG_LEVEL", cls.log_level),
         )
 
@@ -127,6 +151,20 @@ class MeshIrcBridge:
         self._mesh_pending: list[str] = []
         # True once the mesh channel is configured and ready for sends.
         self._mesh_ready = False
+        # Sender names seen in mesh channel chat → last-seen unix time.
+        self._seen_nodes: dict[str, float] = {}
+        self._tasks: set[asyncio.Task] = set()
+        # Command handlers: (sender, args) → reply lines.
+        self._irc_commands = {
+            "repeaters": self._irc_cmd_repeaters,
+            "ping": self._irc_cmd_ping,
+            "list": self._irc_cmd_list,
+        }
+        self._mesh_commands = {
+            "list": self._mesh_cmd_list,
+            "topic": self._mesh_cmd_topic,
+            "raw": self._mesh_cmd_raw,
+        }
 
     # -- run -----------------------------------------------------------------
 
@@ -374,9 +412,19 @@ class MeshIrcBridge:
         # Channel messages embed the sender name in the text itself
         # (e.g. "DeviceName (ShortName): message") — no separate sender
         # field exists in the payload (no sender_name or pubkey_prefix).
+        sender, body = split_sender(text)
+        if sender:
+            self._seen_nodes[sender] = time.time()
+
+        parsed = parse_mesh_command(body, self._cfg.mesh_command_prefix)
+        if parsed and parsed[0] in self._mesh_commands:
+            self._log.info("[mesh command] %s: %s", sender, body)
+            self._spawn(self._run_mesh_command(sender, *parsed))
+            return
+
         self._log.info("[mesh → irc] %s", text)
         if self._irc_bot:
-            self._irc_bot.queue_to_irc(text)
+            self._irc_bot.send_to_channel(text)
 
     async def _on_connected(self, event):
         self._log.info("[meshcore] connected: %s", event.payload)
@@ -517,12 +565,178 @@ class MeshIrcBridge:
         for text in pending:
             await self._throttled_send_to_mesh(text)
 
-    def _on_irc_message(self, sender: str, text: str):
+    def _on_irc_message(self, sender: str, text: str, reply_to: str, private: bool):
+        """Handle an IRC line (called from the IRC thread)."""
+        parsed = parse_irc_command(
+            text, self._irc_bot.nickname, self._cfg.irc_command_prefix, private
+        )
+        if parsed and parsed[0] in self._irc_commands and self._loop:
+            self._log.info("[irc command] %s: %s", sender, text)
+            self._loop.call_soon_threadsafe(
+                self._spawn, self._run_irc_command(sender, reply_to, *parsed)
+            )
+            return
+
+        if private:
+            text = f"[PM] {text}"
         self._log.info("[irc → mesh] from IRC: <%s> %s", sender, text)
         if self._loop:
             self._loop.call_soon_threadsafe(
                 self._irc_to_mesh.put_nowait, f"<{sender}> {text}"
             )
+
+    # -- commands ------------------------------------------------------------
+
+    def _spawn(self, coro):
+        """Run *coro* in the background, keeping a reference until it ends."""
+        task = asyncio.ensure_future(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _run_irc_command(self, sender: str, reply_to: str, cmd: str, args: str):
+        try:
+            lines = await self._irc_commands[cmd](sender, args)
+        except Exception as exc:
+            self._log.exception("IRC command %r failed", cmd)
+            lines = [f"{cmd} failed: {exc}"]
+        for line in lines:
+            self._irc_bot.send(reply_to, line)
+
+    async def _run_mesh_command(self, sender: Optional[str], cmd: str, args: str):
+        try:
+            lines = await self._mesh_commands[cmd](sender, args)
+        except Exception as exc:
+            self._log.exception("Mesh command %r failed", cmd)
+            lines = [f"{cmd} failed: {exc}"]
+        for line in lines:
+            await self._send_to_mesh(line)
+
+    def _mesh_connected(self) -> bool:
+        return self._mc is not None and self._mc.is_connected
+
+    # IRC-side commands
+
+    async def _irc_cmd_repeaters(self, sender: str, args: str) -> list[str]:
+        if not self._mesh_connected():
+            return ["MeshCore node is not connected."]
+        await self._mc.ensure_contacts(follow=True)
+        repeaters = sorted(
+            (c for c in self._mc.contacts.values()
+             if c.get("type") == CONTACT_TYPE_REPEATER),
+            key=lambda c: c["adv_name"].lower(),
+        )
+        if not repeaters:
+            return ["No repeaters known."]
+        items = [f"{c['adv_name']} [{c['public_key'][:8]}]" for c in repeaters]
+        return [f"{len(repeaters)} repeater(s):"] + pack_lines(items)
+
+    async def _irc_cmd_ping(self, sender: str, args: str) -> list[str]:
+        query = args.strip()
+        if not query:
+            return ["Usage: ping <name or hex hash of a repeater/room>"]
+        if not self._mesh_connected():
+            return ["MeshCore node is not connected."]
+        await self._mc.ensure_contacts(follow=True)
+
+        matches = find_infra_contacts(self._mc.contacts.values(), query)
+        if len(matches) > 1:
+            names = ", ".join(
+                f"{c['adv_name']} [{c['public_key'][:4]}]" for c in matches[:5]
+            )
+            more = f" (+{len(matches) - 5} more)" if len(matches) > 5 else ""
+            return [f"'{query}' is ambiguous: {names}{more}"]
+
+        if matches:
+            contact = matches[0]
+            key = contact["public_key"].lower()
+            if is_hex(query) and key.startswith(query.lower()):
+                hash_hex = path_hash_hex(query)
+            else:
+                hash_hex = key[: PING_NAME_HASH_BYTES * 2]
+            label = f"{contact['adv_name']} [{hash_hex}]"
+        elif is_hex(query) and len(query) >= 2:
+            # Unknown node: still worth tracing a bare hash.
+            hash_hex = path_hash_hex(query)
+            label = f"[{hash_hex}]"
+        else:
+            return [f"No repeater or room matching '{query}'."]
+
+        result = await self._trace(hash_hex)
+        if result is None:
+            return [f"No response from {label}."]
+        rtt_ms, path = result
+        snr = ""
+        if path:
+            snr = f", SNR out {path[0]['snr']:+.1f} / back {path[-1]['snr']:+.1f} dB"
+        return [f"Pong from {label}: {rtt_ms:.0f} ms{snr}"]
+
+    async def _trace(self, hash_hex: str) -> Optional[tuple[float, list]]:
+        """Trace through *hash_hex*; return ``(rtt_ms, path)`` or None on timeout."""
+        tag = random.randint(1, 0xFFFFFFFF)
+        reply: asyncio.Future = asyncio.get_running_loop().create_future()
+
+        async def on_trace(event):
+            if not reply.done():
+                reply.set_result(event.payload)
+
+        sub = self._mc.subscribe(
+            EventType.TRACE_DATA, on_trace, attribute_filters={"tag": tag}
+        )
+        try:
+            started = time.monotonic()
+            sent = await self._mc.commands.send_trace(tag=tag, path=hash_hex)
+            if sent.type == EventType.ERROR:
+                raise RuntimeError(f"trace send failed: {sent.payload}")
+            timeout = max(
+                sent.payload["suggested_timeout"] / 1000, MIN_PING_TIMEOUT_SECS
+            )
+            try:
+                payload = await asyncio.wait_for(reply, timeout)
+            except asyncio.TimeoutError:
+                return None
+            return (time.monotonic() - started) * 1000, payload.get("path", [])
+        finally:
+            sub.unsubscribe()
+
+    async def _irc_cmd_list(self, sender: str, args: str) -> list[str]:
+        page = int(args) if args.isdigit() else 1
+        if not self._seen_nodes:
+            return ["No nodes seen in chat yet."]
+        if self._mesh_connected():
+            await self._mc.ensure_contacts(follow=True)
+        names = sorted(self._seen_nodes, key=self._seen_nodes.get, reverse=True)
+        shown, page, total = paginate(names, page, LIST_PAGE_SIZE)
+        lines = []
+        for name in shown:
+            contact = self._mc.get_contact_by_name(name) if self._mc else None
+            key = contact["public_key"] if contact else "unknown key"
+            lines.append(f"{name}  {key}")
+        if total > 1:
+            lines.append(f"Page {page}/{total} — 'list <page>' for more")
+        return lines
+
+    # Mesh-side commands
+
+    async def _mesh_cmd_list(self, sender: Optional[str], args: str) -> list[str]:
+        groups = self._irc_bot.channel_members()
+        if not groups:
+            return ["Not in the IRC channel yet."]
+        return [f"{label} ({len(nicks)}): {', '.join(nicks)}" for label, nicks in groups]
+
+    async def _mesh_cmd_topic(self, sender: Optional[str], args: str) -> list[str]:
+        topic = self._irc_bot.topic
+        return [f"Topic: {topic}" if topic else "No topic set."]
+
+    async def _mesh_cmd_raw(self, sender: Optional[str], args: str) -> list[str]:
+        prefix = self._cfg.mesh_command_prefix
+        if not args:
+            return [f"Usage: {prefix}raw <text>"]
+        # Callout first so the raw line is the last thing other bots see.
+        self._irc_bot.send_to_channel(
+            f"[MeshCore] {sender or 'unknown node'} used {prefix}raw"
+        )
+        self._irc_bot.send_to_channel(args)
+        return []
 
     # -- IRC -----------------------------------------------------------------
 
@@ -622,6 +836,7 @@ class _IrcBot(irc.bot.SingleServerIRCBot):
         self._cfg = config
         self._on_message = on_message_callback
         self._log = logging.getLogger("irc")
+        self.topic: Optional[str] = None
 
         kwargs = {}
         if config.irc_use_tls:
@@ -662,29 +877,71 @@ class _IrcBot(irc.bot.SingleServerIRCBot):
         text = event.arguments[0]
         if nick == self._cfg.irc_nick:
             return
-        self._on_message(nick, text)
+        self._on_message(nick, text, self._cfg.irc_channel, False)
 
     def on_privmsg(self, conn, event):
         nick = irc.client.NickMask(event.source).nick
         text = event.arguments[0]
         if nick == self._cfg.irc_nick:
             return
-        self._on_message(nick, f"[PM] {text}")
+        self._on_message(nick, text, nick, True)
+
+    def on_currenttopic(self, conn, event):
+        channel, topic = event.arguments
+        if channel.lower() == self._cfg.irc_channel.lower():
+            self.topic = topic
+
+    def on_notopic(self, conn, event):
+        self.topic = None
+
+    def on_topic(self, conn, event):
+        if event.target.lower() == self._cfg.irc_channel.lower():
+            self.topic = event.arguments[0] or None
 
     def on_disconnect(self, conn, event):
+        self.topic = None
         conn.clear_keepalive()
         self._log.warning("Disconnected from IRC — will auto-reconnect")
 
-    def queue_to_irc(self, text: str):
+    @property
+    def nickname(self) -> str:
+        """Our current nick (may differ from the configured one after a clash)."""
+        return self.connection.get_nickname()
+
+    def send(self, target: str, text: str):
         conn = self.connection
         if not conn.is_connected():
             return
         try:
-            # Sender name is already embedded in the text by the MeshCore
-            # firmware (e.g. "DeviceName (ShortName): message").
-            conn.privmsg(self._cfg.irc_channel, text)
+            conn.privmsg(target, text)
         except irc.client.ServerNotConnectedError:
             self._log.debug("Dropped message to IRC — not connected")
+
+    def send_to_channel(self, text: str):
+        self.send(self._cfg.irc_channel, text)
+
+    def channel_members(self) -> list[tuple[str, list[str]]]:
+        """Channel members grouped by their highest status, highest first."""
+        channel = self.channels.get(self._cfg.irc_channel)
+        if channel is None:
+            return []
+        tiers = [
+            ("Owners", channel.owners()),
+            ("Admins", channel.admins()),
+            ("Ops", channel.opers()),
+            ("Halfops", channel.halfops()),
+            ("Voice", channel.voiced()),
+        ]
+        remaining = set(channel.users())
+        groups = []
+        for label, nicks in tiers:
+            members = sorted(remaining.intersection(nicks), key=str.lower)
+            remaining.difference_update(members)
+            if members:
+                groups.append((label, members))
+        if remaining:
+            groups.append(("Users", sorted(remaining, key=str.lower)))
+        return groups
 
     def stop(self):
         try:
