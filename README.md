@@ -50,6 +50,7 @@ Commands are not bridged; the bridge answers them directly.
 |---|---|
 | `repeaters` | List known repeaters with the start of their public key |
 | `ping <name\|hash>` | Trace a repeater/room. Partial names work; a hex hash matches by public-key prefix and the trace hash width grows with the hash given (2 hex chars = 1 byte, 4 = 2, 8 = 4, 16+ = 8) |
+| `help [command]` | Show available commands, or usage for one |
 | `list [page]` | Node names seen in mesh chat with their public keys, 3 per page |
 
 **MeshCore** — send in the bridged channel:

@@ -161,6 +161,7 @@ class MeshIrcBridge:
             "repeaters": self._irc_cmd_repeaters,
             "ping": self._irc_cmd_ping,
             "list": self._irc_cmd_list,
+            "help": self._irc_cmd_help,
         }
         self._mesh_commands = {
             "list": self._mesh_cmd_list,
@@ -620,7 +621,18 @@ class MeshIrcBridge:
 
     # IRC-side commands
 
+    async def _irc_cmd_help(self, sender: str, args: str) -> list[str]:
+        """help [command] — show available commands or details for one"""
+        prefix = self._cfg.irc_command_prefix
+        name = args.strip().lstrip(prefix).lower() if args.strip() else ""
+        if name in self._irc_commands:
+            return [f"{prefix}{self._irc_commands[name].__doc__}"]
+        if name:
+            return [f"Unknown command '{name}'."]
+        return [f"{prefix}{h.__doc__}" for h in self._irc_commands.values()]
+
     async def _irc_cmd_repeaters(self, sender: str, args: str) -> list[str]:
+        """repeaters — list known repeaters"""
         if not self._mesh_connected():
             return ["MeshCore node is not connected."]
         await self._mc.ensure_contacts(follow=True)
@@ -635,6 +647,7 @@ class MeshIrcBridge:
         return [f"{len(repeaters)} repeater(s):"] + pack_lines(items)
 
     async def _irc_cmd_ping(self, sender: str, args: str) -> list[str]:
+        """ping <name|hex hash> — ping a repeater/room (partial name or hash prefix)"""
         query = args.strip()
         if not query:
             return ["Usage: ping <name or hex hash of a repeater/room>"]
@@ -703,6 +716,7 @@ class MeshIrcBridge:
             sub.unsubscribe()
 
     async def _irc_cmd_list(self, sender: str, args: str) -> list[str]:
+        """list [page] — node names seen in mesh chat with public keys"""
         page = int(args) if args.isdigit() else 1
         if not self._seen_nodes:
             return ["No nodes seen in chat yet."]
