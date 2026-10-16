@@ -57,11 +57,8 @@ class ChannelType(Enum):
     PRIVATE = "private"
 
 
-# MeshCore protocol overhead per message: command(1) + subcmd(1) +
-# chan_idx(1) + timestamp(4) = 7 bytes.  Frame max is 300 bytes, and
-# the firmware payload limit is ~228 bytes, so ~221 bytes remain for
-# text.  160 chars is a safe default that works for most UTF-8 text.
-DEFAULT_MAX_MSG_LENGTH = 160
+# Practical per-message limit for channel text on the mesh.
+DEFAULT_MAX_MSG_LENGTH = 130
 DEFAULT_THROTTLE_SECS = 3.0
 # Cap on the IRC → mesh backlog held while the mesh node is unreachable.
 MAX_PENDING_MESSAGES = 200
