@@ -152,6 +152,7 @@ class MeshIrcBridge:
         self._mesh_pending: list[str] = []
         # True once the mesh channel is configured and ready for sends.
         self._mesh_ready = False
+        self._mentions = MentionRewriter()
         # Sender names seen in mesh channel chat → last-seen unix time.
         self._seen_nodes: dict[str, float] = {}
         self._tasks: set[asyncio.Task] = set()
@@ -416,6 +417,7 @@ class MeshIrcBridge:
         sender, body = split_sender(text)
         if sender:
             self._seen_nodes[sender] = time.time()
+            self._mentions.learn(sender)
 
         parsed = parse_mesh_command(body, self._cfg.mesh_command_prefix)
         if parsed and parsed[0] in self._mesh_commands:
@@ -423,7 +425,6 @@ class MeshIrcBridge:
             self._spawn(self._run_mesh_command(sender, *parsed))
             return
 
-        self._mentions.learn(text)
         self._log.info("[mesh → irc] %s", text)
         if self._irc_bot:
             self._irc_bot.send_to_channel(text)

@@ -1,8 +1,8 @@
 """Pure helpers for converting IRC nick mentions into MeshCore mentions.
 
 The MeshCore app only registers ``@[Full Node Name]`` as a mention, e.g.
-``@[Ben (@benbaptist)]``.  Mesh senders are learned from incoming channel
-messages, which are formatted ``Full Node Name: text``.
+``@[Ben (@benbaptist)]``.  Mesh senders are learned
+from the sender names of incoming channel messages.
 """
 
 import re
@@ -17,12 +17,8 @@ class MentionRewriter:
         self._aliases: dict[str, str] = {}
         self._pattern: re.Pattern | None = None
 
-    def learn(self, mesh_text: str) -> None:
-        """Record the sender of a mesh channel message (``Name: text``)."""
-        name, sep, _ = mesh_text.partition(": ")
-        name = name.strip()
-        if not sep or not name:
-            return
+    def learn(self, name: str) -> None:
+        """Record a mesh sender's full node name."""
         aliases = [name]
         handle = _HANDLE_RE.search(name)
         if handle:
