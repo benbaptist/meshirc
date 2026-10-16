@@ -42,6 +42,7 @@ from commands import (
     path_hash_hex,
     split_sender,
 )
+from mentions import MentionRewriter
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -422,6 +423,7 @@ class MeshIrcBridge:
             self._spawn(self._run_mesh_command(sender, *parsed))
             return
 
+        self._mentions.learn(text)
         self._log.info("[mesh → irc] %s", text)
         if self._irc_bot:
             self._irc_bot.send_to_channel(text)
@@ -582,7 +584,8 @@ class MeshIrcBridge:
         self._log.info("[irc → mesh] from IRC: <%s> %s", sender, text)
         if self._loop:
             self._loop.call_soon_threadsafe(
-                self._irc_to_mesh.put_nowait, f"<{sender}> {text}"
+                self._irc_to_mesh.put_nowait,
+                f"<{sender}> {self._mentions.rewrite(text)}",
             )
 
     # -- commands ------------------------------------------------------------
