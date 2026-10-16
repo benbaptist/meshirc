@@ -164,6 +164,7 @@ class MeshIrcBridge:
             "list": self._mesh_cmd_list,
             "topic": self._mesh_cmd_topic,
             "raw": self._mesh_cmd_raw,
+            "help": self._mesh_cmd_help,
         }
 
     # -- run -----------------------------------------------------------------
@@ -732,17 +733,31 @@ class MeshIrcBridge:
 
     # Mesh-side commands
 
+    async def _mesh_cmd_help(self, sender: Optional[str], args: str) -> list[str]:
+        """help [command] — list commands or show usage for one"""
+        prefix = self._cfg.mesh_command_prefix
+        name = args.strip().lstrip(prefix).lower()
+        if name in self._mesh_commands:
+            return [f"{prefix}{self._mesh_commands[name].__doc__}"]
+        if name:
+            return [f"Unknown command '{name}'."]
+        names = " ".join(f"{prefix}{n}" for n in self._mesh_commands)
+        return [f"Commands: {names} — {prefix}help <command> for usage"]
+
     async def _mesh_cmd_list(self, sender: Optional[str], args: str) -> list[str]:
+        """list — IRC channel members by status"""
         groups = self._irc_bot.channel_members()
         if not groups:
             return ["Not in the IRC channel yet."]
         return [f"{label} ({len(nicks)}): {', '.join(nicks)}" for label, nicks in groups]
 
     async def _mesh_cmd_topic(self, sender: Optional[str], args: str) -> list[str]:
+        """topic — IRC channel topic"""
         topic = self._irc_bot.topic
         return [f"Topic: {topic}" if topic else "No topic set."]
 
     async def _mesh_cmd_raw(self, sender: Optional[str], args: str) -> list[str]:
+        """raw <text> — send text to IRC with no sender prefix"""
         prefix = self._cfg.mesh_command_prefix
         if not args:
             return [f"Usage: {prefix}raw <text>"]
