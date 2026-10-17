@@ -165,6 +165,7 @@ class MeshIrcBridge:
             "topic": self._mesh_cmd_topic,
             "raw": self._mesh_cmd_raw,
             "help": self._mesh_cmd_help,
+            "ping": self._mesh_cmd_ping,
         }
 
     # -- run -----------------------------------------------------------------
@@ -612,7 +613,8 @@ class MeshIrcBridge:
             self._log.exception("Mesh command %r failed", cmd)
             lines = [f"{cmd} failed: {exc}"]
         for line in lines:
-            await self._send_to_mesh(line)
+            reply = f"@[{sender}] {line}" if sender else line
+            await self._send_to_mesh(reply)
 
     def _mesh_connected(self) -> bool:
         return self._mc is not None and self._mc.is_connected
@@ -733,6 +735,10 @@ class MeshIrcBridge:
 
     # Mesh-side commands
 
+    async def _mesh_cmd_ping(self, sender: Optional[str], args: str) -> list[str]:
+        """ping — check that the bridge is responsive"""
+        return ["Pong! Bridge is responsive."]
+
     async def _mesh_cmd_help(self, sender: Optional[str], args: str) -> list[str]:
         """help [command] — list commands or show usage for one"""
         prefix = self._cfg.mesh_command_prefix
@@ -766,7 +772,7 @@ class MeshIrcBridge:
             f"{sender or 'unknown node'} said:"
         )
         self._irc_bot.send_to_channel(args)
-        return []
+        return ["Sent to IRC."]
 
     # -- IRC -----------------------------------------------------------------
 

@@ -57,7 +57,10 @@ Commands are not bridged; the bridge answers them directly.
 
 | Command | Description |
 |---|---|
+| `!ping` | Confirm that the bridge is responsive |
 | `!help [command]` | Show available commands, or usage for one |
 | `!list` | IRC channel members grouped by status (ops, voice, ...) |
 | `!topic` | IRC channel topic |
 | `!raw <text>` | Send `<text>` to IRC without the sender prefix, preceded by a `<node> said:` message naming the calling node |
+
+Mesh-side command replies mention the node that ran the command.
