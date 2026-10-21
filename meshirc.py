@@ -584,10 +584,12 @@ class MeshIrcBridge:
             text = f"[PM] {text}"
         self._log.info("[irc → mesh] from IRC: <%s> %s", sender, text)
         if self._loop:
-            self._loop.call_soon_threadsafe(
-                self._irc_to_mesh.put_nowait,
-                f"<{sender}> {self._mentions.rewrite(text)}",
-            )
+            self._loop.call_soon_threadsafe(self._queue_irc_to_mesh, sender, text)
+
+    def _queue_irc_to_mesh(self, sender: str, text: str):
+        # Runs on the event loop thread, which also owns the mention state.
+        text = self._mentions.rewrite(text, self._irc_bot.nickname)
+        self._irc_to_mesh.put_nowait(f"<{sender}> {text}")
 
     # -- commands ------------------------------------------------------------
 
