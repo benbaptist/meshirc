@@ -813,19 +813,49 @@ class _SafeServerConnection(irc.client.ServerConnection):
     thread.  ``LenientDecodingLineBuffer`` decodes with ``errors='replace'``,
     substituting U+FFFD for malformed bytes instead of crashing.
 
-    The stock library's ``set_keepalive`` schedules a recurring PING with
-    ``reactor.scheduler.execute_every``; that command outlives the connection,
-    so after a disconnect it fires ``ping()`` against a closed socket and
-    raises ``ServerNotConnectedError`` — killing the reactor thread and, with
-    it, every future reconnect.  The same applies to the library's automatic
-    PONG replies on incoming server PINGs.
+    Sends on a dead connection are no-ops (the library's automatic PONG
+    replies would otherwise raise ``ServerNotConnectedError`` and kill the
+    reactor thread).
 
-    This subclass makes sends on a dead connection no-ops, and replaces the
-    library keepalive with a self-arming one-shot that can be cancelled on
-    disconnect via ``clear_keepalive``.
+    Liveness: the library's reconnect strategy only retries while the socket
+    is *not* connected, so a TCP connection that goes silent — a stalled
+    registration, or a half-open socket after a NAT/server drop — would sit
+    forever and only be noticed when we next write to it.  A watchdog armed
+    on every ``connect()`` PINGs the server every ``KEEPALIVE_SECS`` and
+    force-disconnects (triggering the normal reconnect) if nothing has been
+    received for ``LIVENESS_TIMEOUT_SECS`` or registration hasn't completed
+    within ``REGISTRATION_TIMEOUT_SECS``.
     """
 
     buffer_class = irc.client.buffer.LenientDecodingLineBuffer
+
+    # PING often enough to keep idle-timeouting middleboxes happy; the
+    # server's PONG doubles as the liveness signal.
+    KEEPALIVE_SECS = 15
+    LIVENESS_TIMEOUT_SECS = 60
+    REGISTRATION_TIMEOUT_SECS = 60
+
+    _watchdog_gen = 0
+
+    def connect(self, *args, **kwargs):
+        result = super().connect(*args, **kwargs)
+        self._connected_at = self._last_rx = time.monotonic()
+        self._registered = False
+        self._start_watchdog()
+        return result
+
+    def disconnect(self, message=""):
+        self._watchdog_gen += 1  # cancel any pending watchdog tick
+        super().disconnect(message)
+
+    def process_data(self):
+        self._last_rx = time.monotonic()
+        super().process_data()
+
+    def _handle_event(self, event):
+        if event.type == "welcome":
+            self._registered = True
+        super()._handle_event(event)
 
     def ping(self, target, target2=""):
         if self.is_connected():
@@ -835,24 +865,32 @@ class _SafeServerConnection(irc.client.ServerConnection):
         if self.is_connected():
             super().pong(target, target2)
 
-    def set_keepalive(self, interval):
-        self._keepalive_interval = interval
-        # Each keepalive call invalidates any previously scheduled chain, so
-        # reconnects don't stack duplicate pingers.
-        gen = getattr(self, "_keepalive_gen", 0) + 1
-        self._keepalive_gen = gen
+    def _start_watchdog(self):
+        # A new generation per connection so a stale chain can never fire
+        # against a later connection.
+        self._watchdog_gen += 1
+        gen = self._watchdog_gen
+        log = logging.getLogger("irc")
 
         def tick():
-            if getattr(self, "_keepalive_gen", 0) != gen:
-                return  # superseded by a newer keepalive or a disconnect
-            self.ping("keep-alive")  # guarded no-op when disconnected
-            self.reactor.scheduler.execute_after(self._keepalive_interval, tick)
+            if self._watchdog_gen != gen or not self.is_connected():
+                return
+            now = time.monotonic()
+            if not self._registered and now - self._connected_at > self.REGISTRATION_TIMEOUT_SECS:
+                log.warning("IRC registration timed out — dropping connection")
+                self.disconnect("Registration timeout")
+                return
+            if now - self._last_rx > self.LIVENESS_TIMEOUT_SECS:
+                log.warning(
+                    "No data from IRC server for %ds — dropping connection",
+                    int(now - self._last_rx),
+                )
+                self.disconnect("Ping timeout")
+                return
+            self.ping("keep-alive")
+            self.reactor.scheduler.execute_after(self.KEEPALIVE_SECS, tick)
 
-        self.reactor.scheduler.execute_after(self._keepalive_interval, tick)
-
-    def clear_keepalive(self):
-        """Stop the keepalive chain (call on disconnect)."""
-        self._keepalive_gen = getattr(self, "_keepalive_gen", 0) + 1
+        self.reactor.scheduler.execute_after(self.KEEPALIVE_SECS, tick)
 
 
 class _SafeReactor(irc.client.Reactor):
@@ -862,11 +900,6 @@ class _SafeReactor(irc.client.Reactor):
 class _IrcBot(irc.bot.SingleServerIRCBot):
 
     reactor_class = _SafeReactor
-
-    # Keepalive: send a PING every KEEPALIVE_SECS to keep the socket (and any
-    # intervening NAT/firewall mapping) alive.  15s is aggressive enough to
-    # stop idle timeouts from both the ircd and middleboxes.
-    KEEPALIVE_SECS = 15
 
     def __init__(self, config: Config, on_message_callback):
         self._cfg = config
@@ -900,10 +933,6 @@ class _IrcBot(irc.bot.SingleServerIRCBot):
         conn.join(self._cfg.irc_channel)
         self._log.info("Joined IRC channel %s", self._cfg.irc_channel)
 
-        # Start client-side keepalive PINGs so the IRC server doesn't
-        # drop us for idling.
-        conn.set_keepalive(self.KEEPALIVE_SECS)
-
         # Reset the exponential-backoff attempt counter so that a
         # successful connection always restores the shortest delay.
         self.recon.attempt_count = itertools.count(1)
@@ -936,7 +965,6 @@ class _IrcBot(irc.bot.SingleServerIRCBot):
 
     def on_disconnect(self, conn, event):
         self.topic = None
-        conn.clear_keepalive()
         self._log.warning("Disconnected from IRC — will auto-reconnect")
 
     @property
